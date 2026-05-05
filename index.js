@@ -2588,7 +2588,7 @@ client.once('ready', async () => {
 
   // Definir status do bot
   client.user.setActivity({
-    name: '📊 Sessões aos Sábados',
+    name: '𝙼𝚊𝚍𝚎 𝚋𝚢 𝚈𝟸𝚔_𝙽𝚊𝚝',
     type: ActivityType.Watching
   });
 
@@ -2597,7 +2597,7 @@ client.once('ready', async () => {
     '📊 Sessões aos Sábados',
     '🏆 Sistema de Progressão',
     '🔗 /mytier para ver perfil',
-    '👑 Evolua seu tier!'
+    '𝙼𝚊𝚍𝚎 𝚋𝚢 𝚈𝟸𝚔_𝙽𝚊𝚝'
   ];
   
   let statusIndex = 0;
