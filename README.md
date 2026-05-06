@@ -217,6 +217,5 @@ Encontrou um bug? Tem uma sugestão? Entre em contato com o desenvolvedor:
 <p align="center">
   <b>© 2026 Ascend System • 𝙼𝚊𝚍𝚎 𝙱𝚢 𝚈𝟸𝚔_𝙽𝚊𝚝</b>
 </p>
-```
 
 ---
