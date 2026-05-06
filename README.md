@@ -1,6 +1,6 @@
 markdown
 <p align="center">
-  <img src="LINK_IMAGEM" width="100%">
+  <img src="https://cdn.discordapp.com/attachments/1491453647739944970/1501648186178015442/file_000000002280720e9d1f585b2c9938e6.png?ex=69fcd65a&is=69fb84da&hm=780a9ff0baab300f5afbab663e0c61b1f17b131846442d9304c87cede41215f2&" width="100%">
 </p>
 
 <p align="center">
