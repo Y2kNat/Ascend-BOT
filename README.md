@@ -205,6 +205,7 @@ Este projeto está licenciado sob a licença MIT. Veja o arquivo LICENSE para ma
 Encontrou um bug? Tem uma sugestão? Entre em contato com o desenvolvedor:
 
 · Discord: y2k_nat
+
 · Email: ornelasisac13@gmail.com
 
 ---
