@@ -20,14 +20,26 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL;
 // Carregar tiers dinamicamente (suporta quantos quiser no .env)
 const TIERS_CONFIG = {};
 let tierCount = 1;
-while (process.env[`TIER_${tierCount}`]) {
+const getTierRole = tier => process.env[`TIER_${tier}_ROLE`] || process.env[`TIER_${tier}`];
+const getTierSessions = tier => process.env[`TIER_${tier}_SESSIONS`] || process.env[`TIER_${tier}_SESSION`];
+while (getTierRole(tierCount)) {
   TIERS_CONFIG[tierCount] = {
-    roleId: process.env[`TIER_${tierCount}`],
-    sessionsNeeded: parseInt(process.env[`TIER_${tierCount}_SESSION`]) || 0
+    roleId: getTierRole(tierCount),
+    sessionsNeeded: parseInt(getTierSessions(tierCount)) || 0
   };
   tierCount++;
 }
 const MAX_TIERS = tierCount - 1;
+
+function getMaxTierLevel(config) {
+  const tiers = config?.tiers || {};
+  let max = 0;
+  for (const key of Object.keys(tiers)) {
+    const level = parseInt(String(key).replace(/^TIER_/i, ''), 10);
+    if (Number.isFinite(level) && level > max) max = level;
+  }
+  return max > 0 ? max : MAX_TIERS;
+}
 
 // ============================================
 // CORES E EMOJIS DOS TIERS
@@ -37,7 +49,9 @@ const TIER_COLORS = {
   2: '#00FF00', // Verde
   3: '#0099FF', // Azul
   4: '#9932CC', // Roxo
-  5: '#FFD700'  // Dourado
+  5: '#FFD700', // Dourado
+  6: '#FF8C00', // Laranja
+  7: '#8B0000'  // Vinho
 };
 
 const TIER_EMOJIS = {
@@ -45,7 +59,9 @@ const TIER_EMOJIS = {
   2: '🥈',
   3: '🥇',
   4: '💎',
-  5: '👑'
+  5: '👑',
+  6: '🏅',
+  7: '💠'
 };
 
 const TIER_NAMES = {
@@ -53,21 +69,27 @@ const TIER_NAMES = {
   2: 'Aprendiz',
   3: 'Intermediário',
   4: 'Avançado',
-  5: 'Mestre'
+  5: 'Mestre',
+  6: 'Lenda',
+  7: 'Imortal'
 };
 
 const PROMOTION_MESSAGES = {
   2: '🌟 Você está evoluindo! Continue participando das sessões para desbloquear mais benefícios.',
   3: '🔥 Cada vez mais forte! Mais responsabilidades e vantagens te aguardam no servidor.',
   4: '💎 Quase no topo! Você já é uma referência no servidor. Continue assim!',
-  5: '👑 Você atingiu o ápice! O servidor te respeita como um verdadeiro líder.'
+  5: '👑 Você atingiu o ápice! O servidor te respeita como um verdadeiro líder.',
+  6: '🏅 Você se tornou uma lenda! Sua presença transforma o servidor.',
+  7: '💠 Você alcançou o nível imortal! Poucos membros chegam até aqui.'
 };
 
 const PROMOTION_TITLES = {
   2: '🌟 EVOLUÇÃO ALCANÇADA!',
   3: '🔥 PODER AUMENTADO!',
   4: '💎 LENDA EM ASCENSÃO!',
-  5: '👑 MESTRE SUPREMO!'
+  5: '👑 MESTRE SUPREMO!',
+  6: '🏅 LENDA DO SERVIDOR!',
+  7: '💠 NÍVEL IMORTAL!'
 };
 
 // ============================================
@@ -93,7 +115,11 @@ function writeJSON(filePath, data) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    // Escrita atômica: grava em arquivo temporário e renomeia.
+    // Evita que leituras concorrentes enxerguem conteúdo parcial/truncado.
+    const tmp = `${filePath}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, filePath);
     return true;
   } catch (error) {
     console.error(`❌ Erro ao escrever ${filePath}:`, error.message);
@@ -172,6 +198,7 @@ class GuildDB {
     this.joinsPath = path.join(this.base, 'joins.json');
 
     this.initializeFiles();
+    this.ensureTierConfiguration();
   }
 
   initializeFiles() {
@@ -259,6 +286,25 @@ class GuildDB {
     }
   }
 
+  ensureTierConfiguration() {
+    const config = this.config;
+    if (!config.tiers || typeof config.tiers !== 'object') config.tiers = {};
+    let changed = false;
+    for (let i = 1; i <= MAX_TIERS; i++) {
+      const key = `TIER_${i}`;
+      if (config.tiers[key]) continue;
+      config.tiers[key] = {
+        roleId: TIERS_CONFIG[i]?.roleId || '',
+        sessionsNeeded: TIERS_CONFIG[i]?.sessionsNeeded || 0,
+        name: TIER_NAMES[i] || `Tier ${i}`,
+        emoji: TIER_EMOJIS[i] || '⭐',
+        color: TIER_COLORS[i] || '#808080'
+      };
+      changed = true;
+    }
+    if (changed) this.setConfig(config);
+  }
+
   // Getters e Setters
   get config() { return readJSON(this.configPath); }
   setConfig(data) {
@@ -327,6 +373,100 @@ class GuildDB {
   getUserJoins(userId) {
     const data = readJSON(this.joinsPath);
     return data[userId] || [];
+  }
+
+  getJoinById(userId, joinId) {
+    const data = readJSON(this.joinsPath);
+    const list = data[userId];
+    if (!Array.isArray(list)) return null;
+    return list.find(j => j.id === joinId) || null;
+  }
+
+  /**
+   * Busca um join em TODOS os usuários (para recuperar customIds antigos
+   * com userId/joinId embaralhados). Retorna { userId, join } ou null.
+   */
+  findJoinByIdGlobal(joinId) {
+    const data = readJSON(this.joinsPath);
+    for (const [userId, list] of Object.entries(data)) {
+      if (userId === '_metadata' || !Array.isArray(list)) continue;
+      const join = list.find(j => j && j.id === joinId);
+      if (join) return { userId, join };
+    }
+    return null;
+  }
+
+  updateJoin(userId, joinId, patch = {}) {
+    const data = readJSON(this.joinsPath);
+    const list = data[userId];
+    if (!Array.isArray(list)) return null;
+    const join = list.find(j => j.id === joinId);
+    if (!join) return null;
+    Object.assign(join, patch);
+    writeJSON(this.joinsPath, data);
+    return join;
+  }
+
+  /**
+   * Remove um join do histórico (e decrementa totalJoins).
+   * filter(string) → remove o último registro daquele dia (YYYY-MM-DD)
+   * filter.id      → remove o registro com esse ID exato
+   * sem filter     → remove o último registro
+   * Retorna o registro removido ou null.
+   */
+  removeJoin(userId, filter = {}) {
+    const data = readJSON(this.joinsPath);
+    const metadata = data._metadata || {};
+    const list = data[userId];
+    if (!Array.isArray(list) || list.length === 0) return null;
+
+    let index = -1;
+    if (typeof filter === 'string') {
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i].date === filter) { index = i; break; }
+      }
+    } else if (filter?.id) {
+      index = list.findIndex(j => j.id === filter.id);
+    } else {
+      index = list.length - 1;
+    }
+
+    if (index === -1) return null;
+
+    const removed = list.splice(index, 1)[0];
+    metadata.totalJoins = Math.max(0, (metadata.totalJoins || 1) - 1);
+    writeJSON(this.joinsPath, { _metadata: metadata, ...data });
+    return removed;
+  }
+
+  /**
+   * Joins ainda não notificados ao owner das últimas 24h
+   * (independe de virada de data UTC/local e de reinícios do bot).
+   */
+  getRecentUnnotifiedJoins() {
+    const data = readJSON(this.joinsPath);
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const result = [];
+    for (const [userId, list] of Object.entries(data)) {
+      if (userId === '_metadata' || !Array.isArray(list)) continue;
+      for (const join of list) {
+        const ts = Date.parse(join.timestamp || join.date || '');
+        if (Number.isFinite(ts) && ts >= cutoff && !join.notified && !join.approved) {
+          result.push({ userId, join });
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Decrementa o contador de sessões (mínimo 0).
+   */
+  removeSession(userId) {
+    const sessions = this.sessions;
+    sessions[userId] = Math.max(0, (sessions[userId] || 0) - 1);
+    this.setSessions(sessions);
+    return sessions[userId];
   }
 
   // Métodos de usuário
@@ -468,6 +608,7 @@ class GuildDB {
       const members = await guild.members.fetch();
       const config = this.config;
       const users = this.users;
+      const maxTierLevel = getMaxTierLevel(config);
 
       let syncedCount = 0;
 
@@ -476,7 +617,7 @@ class GuildDB {
 
         // Detectar tier pelo cargo do Discord
         let detectedTier = 0;
-        for (let i = MAX_TIERS; i >= 1; i--) {
+        for (let i = maxTierLevel; i >= 1; i--) {
           const roleId = config.tiers[`TIER_${i}`]?.roleId;
           if (roleId && member.roles.cache.has(roleId)) {
             detectedTier = i;
@@ -499,7 +640,7 @@ class GuildDB {
 
         // Se tem tier mas não tem sessões, inicializa com o mínimo
         if (detectedTier > 0 && this.getSessions(member.id) === 0) {
-          const minSessions = TIERS_CONFIG[detectedTier]?.sessionsNeeded || 0;
+          const minSessions = config.tiers[`TIER_${detectedTier}`]?.sessionsNeeded || 0;
           if (minSessions > 0) {
             const sessions = this.sessions;
             sessions[member.id] = minSessions;
@@ -892,58 +1033,170 @@ class TierManager {
     const guildId = member.guild.id;
     const userId = member.id;
     const db = getDB(guildId);
-    
+
+    const config = db.config;
     const currentTier = db.getUserTier(userId);
-    if (currentTier === 0 || currentTier >= MAX_TIERS) {
+    if (currentTier === 0 || currentTier >= getMaxTierLevel(config)) {
       return null;
     }
 
-    const config = db.config;
     const nextTier = config.tiers[`TIER_${currentTier + 1}`];
     if (!nextTier) return null;
 
     const sessions = db.getSessions(userId);
     const sessionsNeeded = nextTier.sessionsNeeded || 0;
 
-    if (sessionsNeeded > 0 && sessions >= sessionsNeeded) {
+    if (sessionsNeeded <= 0 || sessions < sessionsNeeded) {
+      return null;
+    }
+
+    let rolesOk = true;
+
+    if (nextTier.roleId) {
       try {
-        // Remove cargo atual
-        const currentTierConfig = config.tiers[`TIER_${currentTier}`];
-        if (currentTierConfig?.roleId) {
-          await member.roles.remove(currentTierConfig.roleId).catch(err => {
-            Logger.warn(`Erro ao remover cargo Tier ${currentTier}: ${err.message}`);
-          });
-          Logger.promote(`📤 Cargo Tier ${currentTier} removido de ${member.user.tag}`);
-        }
-
-        // Adiciona novo cargo
-        if (nextTier.roleId) {
-          await member.roles.add(nextTier.roleId).catch(err => {
-            Logger.warn(`Erro ao adicionar cargo Tier ${currentTier + 1}: ${err.message}`);
-          });
-          Logger.promote(`📥 Cargo Tier ${currentTier + 1} adicionado a ${member.user.tag}`);
-        }
-
-        // Atualiza banco de dados
-        db.setUser(userId, { 
-          tier: currentTier + 1, 
-          username: member.user.username,
-          lastPromotion: new Date().toISOString()
-        });
-
-        return {
-          promoted: true,
-          from: currentTier,
-          to: currentTier + 1,
-          sessions: sessions,
-          tierData: nextTier
-        };
+        await member.roles.add(nextTier.roleId);
+        Logger.promote(`📥 Cargo Tier ${currentTier + 1} adicionado a ${member.user.tag}`);
       } catch (error) {
-        Logger.error(`❌ Erro na promoção de ${member.user.tag}: ${error.message}`);
+        rolesOk = false;
+        Logger.warn(`Erro ao adicionar cargo Tier ${currentTier + 1}: ${error.message}`);
       }
     }
 
-    return null;
+    const currentTierConfig = config.tiers[`TIER_${currentTier}`];
+    if (rolesOk && currentTierConfig?.roleId) {
+      try {
+        await member.roles.remove(currentTierConfig.roleId);
+        Logger.promote(`📤 Cargo Tier ${currentTier} removido de ${member.user.tag}`);
+      } catch (error) {
+        rolesOk = false;
+        Logger.warn(`Erro ao remover cargo Tier ${currentTier}: ${error.message}`);
+      }
+    }
+
+    if (!rolesOk) {
+      Logger.warn(`⚠️ Promoção de ${member.user.tag} para o Tier ${currentTier + 1} não aplicada (falha de cargo)`);
+      return null;
+    }
+
+    db.setUser(userId, {
+      tier: currentTier + 1,
+      username: member.user.username,
+      lastPromotion: new Date().toISOString()
+    });
+
+    return {
+      promoted: true,
+      from: currentTier,
+      to: currentTier + 1,
+      sessions: sessions,
+      tierData: nextTier
+    };
+  }
+
+  static async promoteEligible(member, config, sessions, maxTierLevel) {
+    const db = getDB(member.guild.id);
+    const userId = member.id;
+    const promoted = [];
+
+    if (member.user.bot) return promoted;
+    if (db.getUserTier(userId) === 0) return promoted;
+
+    let guard = 0;
+    while (guard < maxTierLevel) {
+      const currentTier = db.getUserTier(userId);
+      const nextTier = config.tiers[`TIER_${currentTier + 1}`];
+      const sessionsNeeded = nextTier?.sessionsNeeded || 0;
+      const userSessions = sessions[userId] || 0;
+
+      if (!nextTier || sessionsNeeded <= 0 || userSessions < sessionsNeeded) break;
+
+      const result = await this.promote(member);
+      if (!result) break;
+
+      guard++;
+      promoted.push({ ...result, userId, username: member.user.username });
+    }
+
+    return promoted;
+  }
+
+  static async reconcilePromotions(guild) {
+    const db = getDB(guild.id);
+    const config = db.config;
+    const maxTierLevel = getMaxTierLevel(config);
+    const sessions = db.sessions;
+    const promoted = [];
+
+    for (const member of guild.members.cache.values()) {
+      if (!member || member.user.bot) continue;
+      promoted.push(...await this.promoteEligible(member, config, sessions, maxTierLevel));
+    }
+
+    if (promoted.length > 0) {
+      Logger.promote(`🎉 ${promoted.length} promoção(ões) aplicada(s) por Reconciliação em ${guild.name}`);
+    }
+
+    return promoted;
+  }
+
+  /**
+   * Rebaixa o membro ao tier compatível com as sessões atuais.
+   * Usado quando sessões são removidas (/remove ou reprovação).
+   * Retorna { demoted, from, to, rolesOk } ou null se nada mudou.
+   */
+  static async demoteIfBelow(member) {
+    const db = getDB(member.guild.id);
+    const config = db.config;
+    const userId = member.id;
+    const currentTier = db.getUserTier(userId);
+    if (currentTier <= 0) return null;
+
+    const sessions = db.getSessions(userId);
+    const maxTierLevel = getMaxTierLevel(config);
+
+    // Maior tier compatível com as sessões restantes
+    let targetTier = 0;
+    for (let i = maxTierLevel; i >= 1; i--) {
+      const needed = config.tiers[`TIER_${i}`]?.sessionsNeeded || 0;
+      if (sessions >= needed) { targetTier = i; break; }
+    }
+
+    if (targetTier >= currentTier) return null;
+
+    let rolesOk = true;
+
+    const currentRole = config.tiers[`TIER_${currentTier}`]?.roleId;
+    if (currentRole) {
+      try {
+        await member.roles.remove(currentRole);
+        Logger.promote(`📤 Cargo Tier ${currentTier} removido de ${member.user.tag} (despromoção)`);
+      } catch (error) {
+        rolesOk = false;
+        Logger.warn(`⚠️ Erro ao remover cargo Tier ${currentTier} de ${member.user.tag}: ${error.message}`);
+      }
+    }
+
+    if (targetTier > 0) {
+      const targetRole = config.tiers[`TIER_${targetTier}`]?.roleId;
+      if (targetRole) {
+        try {
+          await member.roles.add(targetRole);
+          Logger.promote(`📥 Cargo Tier ${targetTier} adicionado a ${member.user.tag} (despromoção)`);
+        } catch (error) {
+          rolesOk = false;
+          Logger.warn(`⚠️ Erro ao adicionar cargo Tier ${targetTier} de ${member.user.tag}: ${error.message}`);
+        }
+      }
+    }
+
+    db.setUser(userId, {
+      tier: targetTier,
+      lastDemotion: new Date().toISOString()
+    });
+
+    Logger.promote(`⬇️ ${member.user.tag} rebaixado: Tier ${currentTier} → Tier ${targetTier}`);
+
+    return { demoted: true, from: currentTier, to: targetTier, rolesOk };
   }
 
   static getTierColor(level) {
@@ -952,7 +1205,9 @@ class TierManager {
       2: Colors.Green,
       3: Colors.Blue,
       4: Colors.Purple,
-      5: Colors.Gold
+      5: Colors.Gold,
+      6: Colors.Orange,
+      7: Colors.DarkRed
     };
     return colorMap[level] || Colors.Grey;
   }
@@ -1213,7 +1468,8 @@ class Embeds {
    */
   static welcomeMessage(guildId, user, tier) {
     const db = getDB(guildId);
-    const link = db.config.link;
+    const config = db.config;
+    const link = config.link;
     const color = TierManager.getTierColor(tier);
     const emoji = TierManager.getTierEmoji(tier);
     const tierName = TierManager.getTierName(tier);
@@ -1257,7 +1513,7 @@ class Embeds {
           name: '📊 SUAS INFORMAÇÕES',
           value: [
             `• Solicitações restantes hoje: **${remainingRequests}**`,
-            `• Próximo tier: **${tier < MAX_TIERS ? TierManager.getTierName(tier + 1) : 'Máximo'}**`
+            `• Próximo tier: **${tier < getMaxTierLevel(config) ? TierManager.getTierName(tier + 1) : 'Máximo'}**`
           ].join('\n'),
           inline: false
         }
@@ -1922,7 +2178,22 @@ const slashCommands = [
         .setDescription('Horário no formato HH:MM para definir o horário da sessão (opcional)')
         .setRequired(false)
         .setMinLength(5)
-        .setMaxLength(5))
+        .setMaxLength(5)),
+
+  new SlashCommandBuilder()
+    .setName('remove')
+    .setDescription('🗑️ Remover uma sessão de um usuário (Apenas Proprietário)')
+    .setDMPermission(false)
+    .addUserOption(option =>
+      option.setName('usuario')
+        .setDescription('Usuário que terá a sessão removida')
+        .setRequired(true))
+    .addStringOption(option =>
+      option.setName('data')
+        .setDescription('Data da sessão (YYYY-MM-DD). Vazio = remove a última sessão')
+        .setRequired(false)
+        .setMinLength(10)
+        .setMaxLength(10))
 ];
 
 // ============================================
@@ -1986,11 +2257,14 @@ async function updateLinkPanel(guildId) {
       return;
     }
 
-    // Encontrar mensagem do painel (tem componentes/botões)
+    // Encontrar mensagem do painel (embed do sistema de sessão)
     const panelMessage = messages.find(msg =>
       msg.author.id === client.user.id &&
-      msg.components.length > 0
-    ) || messages.find(msg => msg.author.id === client.user.id);
+      msg.embeds?.[0]?.title?.includes('SISTEMA DE SESSÃO')
+    ) || messages.find(msg =>
+      msg.author.id === client.user.id &&
+      msg.embeds?.[0]?.title?.includes('SESSÃO')
+    );
 
     // Gerar embed atualizado
     const embed = Embeds.linkPanel(guildId);
@@ -2042,6 +2316,113 @@ async function updateLinkPanel(guildId) {
     }
   } catch (error) {
     Logger.error(`❌ Erro crítico ao atualizar painel de link: ${error.message}`);
+  }
+}
+
+// ============================================
+// VERIFICAÇÃO DE SESSÕES NO PRIVADO DO OWNER
+// ============================================
+
+/**
+ * Envia DM ao owner para aprovar/reprovar uma sessão coletada.
+ * Ignora o próprio owner. Falha de DM não interrompe o fluxo do usuário.
+ */
+async function notifyOwnerPendingSession(guildId, userId, joinRecord, totalSessions) {
+  try {
+    if (!OWNER_ID || userId === OWNER_ID) return null;
+
+    const owner = await client.users.fetch(OWNER_ID);
+    const requestingUser = await client.users.fetch(userId).catch(() => null);
+
+    // Usuário não fetchable → usa dados gravados no join
+    const fallbackUser = {
+      id: userId,
+      username: joinRecord.username || `ID ${userId}`,
+      tag: joinRecord.username || `ID ${userId}`,
+      displayAvatarURL: () => null
+    };
+    const userRef = requestingUser || fallbackUser;
+
+    const db = getDB(guildId);
+    const tier = db.getUserTier(userId);
+    const attemptUnix = Math.floor(new Date(joinRecord.timestamp).getTime() / 1000);
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.Orange)
+      .setTitle('🔍 VERIFICAÇÃO DE SESSÃO')
+      .setDescription([
+        `### <@${userId}> coletou o link!`,
+        '',
+        `👤 **Usuário:** \`${userRef.tag || userRef.username}\` (\`${userId}\`)`,
+        `🏆 **Tier:** ${tier > 0 ? `${TierManager.getTierEmoji(tier)} ${TierManager.getTierName(tier)} (Tier ${tier})` : '⚠️ Sem tier'}`,
+        `⏰ **Tentou acessar:** <t:${attemptUnix}:F> (<t:${attemptUnix}:R>)`,
+        `📝 **Sessões totais:** ${totalSessions}`
+      ].join('\n'))
+      .setFooter({
+        text: '✅ Aprovar = sessão permanece • ❌ Reprovar = perde a sessão e fica bloqueado hoje'
+      })
+      .setTimestamp();
+
+    const avatarUrl = requestingUser?.displayAvatarURL?.({ dynamic: true, size: 256 });
+    if (avatarUrl) embed.setThumbnail(avatarUrl);
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`sessao_aprovar:${guildId}:${userId}:${joinRecord.id}`)
+        .setLabel('Aprovar')
+        .setEmoji('✅')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`sessao_reprovar:${guildId}:${userId}:${joinRecord.id}`)
+        .setLabel('Reprovar')
+        .setEmoji('❌')
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    const dm = await owner.send({ embeds: [embed], components: [row] });
+
+    // Marca como notificado (evita reenvio em backfill/restart)
+    db.updateJoin(userId, joinRecord.id, { notified: true });
+
+    return dm;
+  } catch (error) {
+    Logger.warn(`⚠️ Não foi possível notificar o owner: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Backfill: notifica o owner sobre sessões de HOJE que ainda não foram
+ * verificadas (ex: registradas antes de um restart do bot).
+ */
+async function notifyUnnotifiedTodaySessions(guildId) {
+  try {
+    if (!OWNER_ID) return 0;
+
+    const db = getDB(guildId);
+    const pending = db.getRecentUnnotifiedJoins()
+      .filter(item => item.userId !== OWNER_ID);
+
+    if (pending.length === 0) return 0;
+
+    Logger.info(`🔍 ${pending.length} sessão(ões) de hoje pendente(s) de verificação — notificando owner em ${guildId}`);
+
+    let notified = 0;
+    for (const { userId, join } of pending) {
+      const totalSessions = db.getSessions(userId);
+      const sent = await notifyOwnerPendingSession(guildId, userId, join, totalSessions);
+      if (sent) notified++;
+      await new Promise(resolve => setTimeout(resolve, 500)); // evita rate limit
+    }
+
+    if (notified > 0) {
+      Logger.success(`✅ Owner notificado sobre ${notified} sessão(ões) de hoje em ${guildId}`);
+    }
+
+    return notified;
+  } catch (error) {
+    Logger.warn(`⚠️ Erro no backfill de sessões: ${error.message}`);
+    return 0;
   }
 }
 
@@ -2254,6 +2635,18 @@ async function handlePrefixCommand(message) {
 
         const db = getDB(guildId);
 
+        // Bloqueio por reprovação no dia
+        if (db.getUser(message.author.id)?.lastRejectedSession?.date === Validators.getToday()) {
+          return message.reply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(Colors.Red)
+                .setTitle('❌ SESSÃO REPROVADA HOJE')
+                .setDescription('Você foi **reprovado** pela staff hoje e está bloqueado.\n📅 Tente novamente amanhã.')
+            ]
+          });
+        }
+
         // Verificar limite diário
         if (!db.canRequestToday(message.author.id)) {
           return message.reply({
@@ -2283,8 +2676,8 @@ async function handlePrefixCommand(message) {
 
         // Processar solicitação
         const currentTier = db.getUserTier(message.author.id);
-        db.addSession(message.author.id);
-        db.addJoin(message.author.id, message.author.username, currentTier);
+        const totalSessions = db.addSession(message.author.id);
+        const joinRecord = db.addJoin(message.author.id, message.author.username, currentTier);
         db.addTodayRequest(message.author.id);
 
         // Tentar enviar DM
@@ -2311,6 +2704,9 @@ async function handlePrefixCommand(message) {
             ]
           });
         }
+
+        // Notificar o owner (aprovar/reprovar)
+        await notifyOwnerPendingSession(guildId, message.author.id, joinRecord, totalSessions);
 
         // Verificar promoção
         const promoted = await TierManager.promote(message.member);
@@ -2364,7 +2760,8 @@ async function handlePrefixCommand(message) {
               value: [
                 '• `/mytier` - Ver seu perfil e progresso',
                 '• `/config` - Painel de configuração (Owner)',
-                '• `/acess` - Controlar sessão (Owner)'
+                '• `/acess` - Controlar sessão (Owner)',
+                '• `/remove` - Remover sessão (Owner)'
               ].join('\n'),
               inline: false
             },
@@ -2477,6 +2874,7 @@ async function handlePrefixCommand(message) {
               value: [
                 '`/config` - Painel de configuração',
                 '`/acess` - Controlar sessão e agendar datas',
+                '`/remove` - Remover sessão de um usuário',
                 '`$backup` - Criar backup manual'
               ].join('\n'),
               inline: false
@@ -2497,6 +2895,266 @@ async function handlePrefixCommand(message) {
           .setTimestamp();
 
         await message.reply({ embeds: [helpEmbed] });
+        break;
+      }
+
+// ============================================
+      // $remove - Remover sessão de um usuário (Owner)
+      // ============================================
+      case 'remove': {
+        if (!Validators.isOwner(message.author.id)) {
+          await message.reply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(Colors.Red)
+                .setTitle('🔒 ACESSO NEGADO')
+                .setDescription('Apenas o **proprietário do bot** pode usar este comando.')
+            ]
+          });
+          break;
+        }
+
+        const targetUser = message.mentions.users.first();
+        if (!targetUser) {
+          await message.reply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(Colors.Red)
+                .setTitle('❌ USUÁRIO OBRIGATÓRIO')
+                .setDescription('Use: `$remove @usuário [data YYYY-MM-DD]`\nExemplo: `$remove @fulano 2026-10-23`')
+            ]
+          });
+          break;
+        }
+
+        const db = getDB(guildId);
+
+        if (targetUser.bot) {
+          await message.reply({ content: '❌ Bots não possuem sessões.' });
+          break;
+        }
+
+        if (targetUser.id === OWNER_ID) {
+          await message.reply({ content: '❌ Não é possível remover sessões do proprietário do bot.' });
+          break;
+        }
+
+        // Data opcional (segundo argumento não-mention)
+        const dateArg = args.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a));
+        const dateInput = dateArg || null;
+
+        if (dateInput && !Validators.isValidDate(dateInput)) {
+          await message.reply({ content: '❌ **Data inválida!** Use YYYY-MM-DD (ex: 2026-10-23)' });
+          break;
+        }
+
+        const sessionsBefore = db.getSessions(targetUser.id);
+        const removedJoin = db.removeJoin(targetUser.id, dateInput || {});
+
+        if (!removedJoin) {
+          await message.reply({
+            content: dateInput
+              ? `❌ **Nenhuma sessão encontrada.** ${targetUser} não possui sessão registrada em **${dateInput}**.`
+              : `❌ **Nenhuma sessão encontrada.** ${targetUser} não possui sessões registradas.`
+          });
+          break;
+        }
+
+        const sessionsAfter = db.removeSession(targetUser.id);
+
+        // Despromoção automática se ficou abaixo do mínimo do tier
+        let demotion = null;
+        try {
+          const member = await message.guild.members.fetch(targetUser.id);
+          demotion = await TierManager.demoteIfBelow(member);
+        } catch (error) {
+          // Membro não está mais no servidor — segue sem despromover
+        }
+
+        const removeUnix = Math.floor(new Date(removedJoin.timestamp).getTime() / 1000);
+
+        const removeEmbed = new EmbedBuilder()
+          .setColor(Colors.Red)
+          .setTitle('🗑️ SESSÃO REMOVIDA')
+          .setDescription([
+            `Uma sessão de ${targetUser} foi removida pelo proprietário.`,
+            '',
+            `📅 **Sessão removida:** <t:${removeUnix}:F>`,
+            `🏆 **Tier na época:** ${removedJoin.tier > 0 ? `${TierManager.getTierEmoji(removedJoin.tier)} ${TierManager.getTierName(removedJoin.tier)}` : 'Sem tier'}`
+          ].join('\\n'))
+          .addFields([
+            { name: '📝 SESSÕES', value: `**${sessionsBefore}** → **${sessionsAfter}** sessão(ões)`, inline: true },
+            { name: '📅 DATA', value: dateInput || 'Nenhuma (última sessão)', inline: true }
+          ])
+          .setFooter({ text: 'Ascend System v9.0 • $remove' })
+          .setTimestamp();
+
+        if (demotion?.demoted) {
+          removeEmbed.addFields({
+            name: '⬇️ DESPROMOÇÃO APLICADA',
+            value: `Usuário ficou abaixo do mínimo do tier: **Tier ${demotion.from}** → **Tier ${demotion.to}**`
+          });
+        }
+
+        // Enviar DM ao usuário
+        try {
+          const dmEmbed = new EmbedBuilder()
+            .setColor(Colors.Red)
+            .setTitle('🗑️ SESSÃO REMOVIDA')
+            .setDescription([
+              `Uma sessão foi **removida** da sua conta pelo proprietário do bot.`,
+              '',
+              `📅 **Sessão removida:** <t:${removeUnix}:F>`,
+              `📝 **Total de sessões:** ${sessionsAfter}`
+            ].join('\\n'))
+            .setFooter({ text: 'Ascend System v9.0' })
+            .setTimestamp();
+          await targetUser.send({ embeds: [dmEmbed] });
+        } catch (dmError) {
+          Logger.warn(`⚠️ Não foi possível enviar DM de remoção para ${targetUser.tag}: ${dmError.message}`);
+        }
+
+        // Apagar a mensagem do comando
+        try { await message.delete(); } catch (e) {}
+
+        // Enviar embed para a DM do owner
+        try {
+          const owner = await client.users.fetch(OWNER_ID);
+          await owner.send({ embeds: [removeEmbed] });
+        } catch (ownerDmError) {
+          Logger.warn(`⚠️ Não foi possível enviar embed de remoção para o owner: ${ownerDmError.message}`);
+        }
+
+        // Log de auditoria
+        const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
+        if (logChannel) {
+          await logChannel.send({
+            content: `🗑️ Sessão removida de **${targetUser.tag || targetUser.username}** por ${message.author.tag}`,
+            embeds: [removeEmbed]
+          }).catch(e => Logger.warn(`⚠️ Erro ao enviar log de /remove: ${e.message}`));
+        }
+
+        Logger.session(`🗑️ Sessão removida de ${targetUser.tag || targetUser.username} (${dateInput || 'última'}) por ${message.author.tag}`);
+        break;
+      }
+
+// ============================================
+      // $add - Adicionar sessão a um usuário (Owner)
+      // ============================================
+      case 'add': {
+        if (!Validators.isOwner(message.author.id)) {
+          await message.reply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(Colors.Red)
+                .setTitle('🔒 ACESSO NEGADO')
+                .setDescription('Apenas o **proprietário do bot** pode usar este comando.')
+            ]
+          });
+          break;
+        }
+
+        const targetUser = message.mentions.users.first();
+        if (!targetUser) {
+          await message.reply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(Colors.Red)
+                .setTitle('❌ USUÁRIO OBRIGATÓRIO')
+                .setDescription('Use: `$add @usuário`\nExemplo: `$add @fulano`')
+            ]
+          });
+          break;
+        }
+
+        const db = getDB(guildId);
+
+        if (targetUser.bot) {
+          await message.reply({ content: '❌ Bots não possuem sessões.' });
+          break;
+        }
+
+        if (targetUser.id === OWNER_ID) {
+          await message.reply({ content: '❌ Não é possível adicionar sessões ao proprietário do bot.' });
+          break;
+        }
+
+        const currentTier = db.getUserTier(targetUser.id);
+        const totalSessions = db.addSession(targetUser.id);
+        const joinRecord = db.addJoin(targetUser.id, targetUser.username, currentTier);
+
+        // Promoção automática se atingiu o mínimo de um tier superior
+        let promotion = null;
+        try {
+          const member = await message.guild.members.fetch(targetUser.id);
+          promotion = await TierManager.promote(member);
+        } catch (error) {
+          // Membro não está mais no servidor — segue sem promover
+        }
+
+        const addUnix = Math.floor(new Date(joinRecord.timestamp).getTime() / 1000);
+
+        const addEmbed = new EmbedBuilder()
+          .setColor(Colors.Green)
+          .setTitle('➕ SESSÃO ADICIONADA')
+          .setDescription([
+            `Uma sessão foi adicionada a ${targetUser} pelo proprietário.`,
+            '',
+            `📅 **Sessão adicionada:** <t:${addUnix}:F>`,
+            `🏆 **Tier na época:** ${joinRecord.tier > 0 ? `${TierManager.getTierEmoji(joinRecord.tier)} ${TierManager.getTierName(joinRecord.tier)}` : 'Sem tier'}`
+          ].join('\\n'))
+          .addFields([
+            { name: '📝 SESSÕES', value: `**${totalSessions - 1}** → **${totalSessions}** sessão(ões)`, inline: true }
+          ])
+          .setFooter({ text: 'Ascend System v9.0 • $add' })
+          .setTimestamp();
+
+        if (promotion) {
+          addEmbed.addFields({
+            name: '⬆️ PROMOÇÃO APLICADA',
+            value: `Usuário atingiu o mínimo: **Tier ${promotion.from}** → **Tier ${promotion.to}**`
+          });
+        }
+
+        // Enviar DM ao usuário
+        try {
+          const dmEmbed = new EmbedBuilder()
+            .setColor(Colors.Green)
+            .setTitle('➕ SESSÃO ADICIONADA')
+            .setDescription([
+              `Uma sessão foi **adicionada** à sua conta pelo proprietário do bot.`,
+              '',
+              `📅 **Sessão:** <t:${addUnix}:F>`,
+              `📝 **Total de sessões:** ${totalSessions}`
+            ].join('\\n'))
+            .setFooter({ text: 'Ascend System v9.0' })
+            .setTimestamp();
+          await targetUser.send({ embeds: [dmEmbed] });
+        } catch (dmError) {
+          Logger.warn(`⚠️ Não foi possível enviar DM de adição para ${targetUser.tag}: ${dmError.message}`);
+        }
+
+        // Apagar a mensagem do comando
+        try { await message.delete(); } catch (e) {}
+
+        // Enviar embed para a DM do owner
+        try {
+          const owner = await client.users.fetch(OWNER_ID);
+          await owner.send({ embeds: [addEmbed] });
+        } catch (ownerDmError) {
+          Logger.warn(`⚠️ Não foi possível enviar embed de adição para o owner: ${ownerDmError.message}`);
+        }
+
+        // Log de auditoria
+        const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
+        if (logChannel) {
+          await logChannel.send({
+            content: `➕ Sessão adicionada a **${targetUser.tag || targetUser.username}** por ${message.author.tag}`,
+            embeds: [addEmbed]
+          }).catch(e => Logger.warn(`⚠️ Erro ao enviar log de /add: ${e.message}`));
+        }
+
+        Logger.session(`➕ Sessão adicionada a ${targetUser.tag || targetUser.username} por ${message.author.tag}`);
         break;
       }
 
@@ -2630,6 +3288,8 @@ client.once('ready', async () => {
       const memberCount = await db.syncAll(guild);
       Logger.success(`👥 ${memberCount} membros sincronizados em ${guild.name}`);
 
+      await TierManager.reconcilePromotions(guild);
+
       // Resetar cancelamento se mudou o dia
       if (cfg.settings?.sessionCancelled && !Validators.isSaturday()) {
         cfg.settings.sessionCancelled = false;
@@ -2664,6 +3324,9 @@ client.once('ready', async () => {
 
       // Criar backup inicial do servidor
       await createBackup(guildId);
+
+      // Verificar sessões de hoje pendentes com o owner (backfill)
+      await notifyUnnotifiedTodaySessions(guildId);
 
       Logger.success(`✅ Servidor ${guild.name} inicializado com sucesso!`);
     } catch (error) {
@@ -2745,6 +3408,7 @@ client.once('ready', async () => {
 
         // Sincronizar membros
         await db.syncAll(guild);
+        await TierManager.reconcilePromotions(guild);
 
         const cfg = db.config;
         const today = Validators.getToday();
@@ -2928,72 +3592,92 @@ client.on('guildMemberRemove', async (member) => {
 // EVENTO: CARGO ALTERADO MANUALMENTE
 // ============================================
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
-  // Só processar se os cargos realmente mudaram
-  if (oldMember.roles.cache.size === newMember.roles.cache.size) {
+  const oldRoleIds = [...oldMember.roles.cache.keys()];
+  const newRoleIds = [...newMember.roles.cache.keys()];
+  const rolesChanged =
+    oldRoleIds.length !== newRoleIds.length ||
+    oldRoleIds.some(roleId => !newMember.roles.cache.has(roleId));
+
+  if (!rolesChanged) {
     return;
   }
 
-  try {
-    const guildId = newMember.guild.id;
-    const db = getDB(guildId);
-    const config = db.config;
+  setTimeout(async () => {
+    try {
+      const guildId = newMember.guild.id;
+      const db = getDB(guildId);
+      const config = db.config;
+      const maxTierLevel = getMaxTierLevel(config);
 
-    // Detectar o tier baseado nos cargos atuais
-    let detectedTier = 0;
-    for (let i = MAX_TIERS; i >= 1; i--) {
-      const roleId = config.tiers[`TIER_${i}`]?.roleId;
-      if (roleId && newMember.roles.cache.has(roleId)) {
-        detectedTier = i;
-        break;
-      }
-    }
-
-    // Buscar tier anterior
-    const oldUserData = db.getUser(newMember.id);
-    const oldTier = oldUserData?.tier || 0;
-
-    // Só atualizar se o tier realmente mudou
-    if (oldTier !== detectedTier) {
-      // Atualizar no banco de dados
-      db.setUser(newMember.id, {
-        tier: detectedTier,
-        username: newMember.user.username,
-        displayName: newMember.displayName || newMember.user.username,
-        avatar: newMember.user.displayAvatarURL({ dynamic: true })
-      });
-
-      // Se o tier mudou, sincronizar sessões mínimas
-      if (detectedTier > 0) {
-        const currentSessions = db.getSessions(newMember.id);
-        const minSessions = TIERS_CONFIG[detectedTier]?.sessionsNeeded || 0;
-
-        if (currentSessions < minSessions) {
-          const sessions = db.sessions;
-          sessions[newMember.id] = minSessions;
-          db.setSessions(sessions);
-          Logger.info(`📝 Sessões de ${newMember.user.tag} ajustadas para ${minSessions} (mínimo do Tier ${detectedTier})`);
+      // Detectar o tier baseado nos cargos atuais
+      let detectedTier = 0;
+      for (let i = maxTierLevel; i >= 1; i--) {
+        const roleId = config.tiers[`TIER_${i}`]?.roleId;
+        if (roleId && newMember.roles.cache.has(roleId)) {
+          detectedTier = i;
+          break;
         }
       }
 
-      // Enviar log da mudança
-      const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
-      if (logChannel) {
-        try {
-          await logChannel.send({
-            embeds: [Embeds.roleChangeLog(newMember, oldTier, detectedTier)]
-          });
-        } catch (logError) {
-          Logger.warn(`⚠️ Erro ao enviar log de mudança de cargo: ${logError.message}`);
+      // Buscar tier anterior
+      const oldUserData = db.getUser(newMember.id);
+      const oldTier = oldUserData?.tier || 0;
+
+      // Só atualizar se o tier realmente mudou
+      if (oldTier !== detectedTier) {
+        // Atualizar no banco de dados
+        db.setUser(newMember.id, {
+          tier: detectedTier,
+          username: newMember.user.username,
+          displayName: newMember.displayName || newMember.user.username,
+          avatar: newMember.user.displayAvatarURL({ dynamic: true })
+        });
+
+        // Se o tier mudou, sincronizar sessões mínimas
+        if (detectedTier > 0) {
+          const currentSessions = db.getSessions(newMember.id);
+          const minSessions = config.tiers[`TIER_${detectedTier}`]?.sessionsNeeded || 0;
+
+          if (currentSessions < minSessions) {
+            const sessions = db.sessions;
+            sessions[newMember.id] = minSessions;
+            db.setSessions(sessions);
+            Logger.info(`📝 Sessões de ${newMember.user.tag} ajustadas para ${minSessions} (mínimo do Tier ${detectedTier})`);
+          }
+        }
+
+        // Enviar log da mudança
+        const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
+        if (logChannel) {
+          try {
+            await logChannel.send({
+              embeds: [Embeds.roleChangeLog(newMember, oldTier, detectedTier)]
+            });
+          } catch (logError) {
+            Logger.warn(`⚠️ Erro ao enviar log de mudança de cargo: ${logError.message}`);
+          }
+        }
+
+        const tierEmoji = TierManager.getTierEmoji(detectedTier);
+        const tierName = TierManager.getTierName(detectedTier);
+        Logger.info(`🔄 Tier de ${newMember.user.tag}: ${oldTier} → ${detectedTier} ${tierEmoji} ${tierName}`);
+
+        const promotions = await TierManager.promoteEligible(newMember, config, db.sessions, maxTierLevel);
+        for (const promotion of promotions) {
+          if (promotion.userId !== newMember.id) continue;
+          const promoEmbed = Embeds.promotion(newMember.user, promotion.from, promotion.to, promotion.sessions);
+          if (logChannel) {
+            await logChannel.send({
+              content: `🎉 **${newMember.user.username}** foi promovido(a)!`,
+              embeds: [promoEmbed]
+            }).catch(logError => Logger.warn(`⚠️ Erro ao enviar log de promoção: ${logError.message}`));
+          }
         }
       }
-
-      const tierEmoji = TierManager.getTierEmoji(detectedTier);
-      const tierName = TierManager.getTierName(detectedTier);
-      Logger.info(`🔄 Tier de ${newMember.user.tag}: ${oldTier} → ${detectedTier} ${tierEmoji} ${tierName}`);
+    } catch (error) {
+      Logger.error(`❌ Erro ao processar mudança de cargos: ${error.message}`);
     }
-  } catch (error) {
-    Logger.error(`❌ Erro ao processar mudança de cargos: ${error.message}`);
-  }
+  }, 1500);
 });
 
 // ============================================
@@ -3016,7 +3700,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       // Verificar permissão para comandos restritos
-      if (['config', 'acess'].includes(commandName)) {
+      if (['config', 'acess', 'remove'].includes(commandName)) {
         if (!Validators.isOwner(user.id)) {
           return interaction.reply({
             embeds: [
@@ -3250,6 +3934,117 @@ client.on('interactionCreate', async (interaction) => {
           content: '✅ **Sessão ABERTA manualmente!**\nO botão de link está disponível até meia-noite.'
         });
       }
+
+      // ==========================================
+      // /remove - Remover sessão de usuário (Owner)
+      // ==========================================
+      if (commandName === 'remove') {
+        await interaction.deferReply({ ephemeral: true });
+
+        const targetUser = interaction.options.getUser('usuario');
+        const dateInput = interaction.options.getString('data');
+        const db = getDB(guildId);
+
+        if (targetUser?.bot) {
+          return interaction.editReply({ content: '❌ Bots não possuem sessões.' });
+        }
+
+        if (targetUser?.id === OWNER_ID) {
+          return interaction.editReply({ content: '❌ Não é possível remover sessões do proprietário do bot.' });
+        }
+
+        if (dateInput && !Validators.isValidDate(dateInput)) {
+          return interaction.editReply({
+            content: '❌ **Data inválida!**\nUse o formato YYYY-MM-DD (ex: 2026-10-23)'
+          });
+        }
+
+        const sessionsBefore = db.getSessions(targetUser.id);
+        const removedJoin = db.removeJoin(targetUser.id, dateInput || {});
+
+        if (!removedJoin) {
+          return interaction.editReply({
+            content: dateInput
+              ? `❌ **Nenhuma sessão encontrada.**\n${targetUser} não possui sessão registrada em **${dateInput}**.`
+              : `❌ **Nenhuma sessão encontrada.**\n${targetUser} não possui sessões registradas.`
+          });
+        }
+
+        const sessionsAfter = db.removeSession(targetUser.id);
+
+        // Despromoção automática se ficou abaixo do mínimo do tier
+        let demotion = null;
+        try {
+          const member = await interaction.guild.members.fetch(targetUser.id);
+          demotion = await TierManager.demoteIfBelow(member);
+        } catch (error) {
+          // Membro não está mais no servidor — segue sem despromover
+        }
+
+        const removeUnix = Math.floor(new Date(removedJoin.timestamp).getTime() / 1000);
+
+        const removeEmbed = new EmbedBuilder()
+          .setColor(Colors.Red)
+          .setTitle('🗑️ SESSÃO REMOVIDA')
+          .setDescription([
+            `Uma sessão de ${targetUser} foi removida pelo proprietário.`,
+            '',
+            `📅 **Sessão removida:** <t:${removeUnix}:F>`,
+            `🏆 **Tier na época:** ${removedJoin.tier > 0 ? `${TierManager.getTierEmoji(removedJoin.tier)} ${TierManager.getTierName(removedJoin.tier)}` : 'Sem tier'}`
+          ].join('\n'))
+          .addFields([
+            {
+              name: '📝 SESSÕES',
+              value: `**${sessionsBefore}** → **${sessionsAfter}** sessão(ões)`,
+              inline: true
+            },
+            {
+              name: '📅 DATA ESPECIFICADA',
+              value: dateInput || 'Nenhuma (última sessão)',
+              inline: true
+            }
+          ])
+          .setFooter({ text: 'Ascend System v9.0 • /remove' })
+          .setTimestamp();
+
+        if (demotion?.demoted) {
+          removeEmbed.addFields({
+            name: '⬇️ DESPROMOÇÃO APLICADA',
+            value: `Usuário ficou abaixo do mínimo do tier: **Tier ${demotion.from}** → **Tier ${demotion.to}**`
+          });
+        }
+
+        // Enviar DM ao usuário
+        try {
+          const dmEmbed = new EmbedBuilder()
+            .setColor(Colors.Red)
+            .setTitle('🗑️ SESSÃO REMOVIDA')
+            .setDescription([
+              `Uma sessão foi **removida** da sua conta pelo proprietário do bot.`,
+              '',
+              `📅 **Sessão removida:** <t:${removeUnix}:F>`,
+              `📝 **Total de sessões:** ${sessionsAfter}`
+            ].join('\\n'))
+            .setFooter({ text: 'Ascend System v9.0' })
+            .setTimestamp();
+          await targetUser.send({ embeds: [dmEmbed] });
+        } catch (dmError) {
+          Logger.warn(`⚠️ Não foi possível enviar DM de remoção para ${targetUser.tag}: ${dmError.message}`);
+        }
+
+        await interaction.editReply({ embeds: [removeEmbed] });
+
+        // Log de auditoria
+        const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
+        if (logChannel) {
+          await logChannel.send({
+            content: `🗑️ Sessão removida de **${targetUser.tag || targetUser.username}** por ${interaction.user.tag}`,
+            embeds: [removeEmbed]
+          }).catch(e => Logger.warn(`⚠️ Erro ao enviar log de /remove: ${e.message}`));
+        }
+
+        Logger.session(`🗑️ Sessão removida de ${targetUser.tag || targetUser.username} (${dateInput || 'última'}) por ${interaction.user.tag}`);
+      }
     }
 
     // ==========================================
@@ -3257,6 +4052,224 @@ client.on('interactionCreate', async (interaction) => {
     // ==========================================
     if (interaction.isButton()) {
       const { customId, user, member, guildId } = interaction;
+
+      // ==========================================
+      // Aprovar/Reprovar sessão (privado do Owner)
+      // ==========================================
+      if (customId.startsWith('sessao_aprovar:') || customId.startsWith('sessao_reprovar:')) {
+        if (!Validators.isOwner(user.id)) {
+          return interaction.reply({
+            content: '❌ Apenas o proprietário do bot pode aprovar ou reprovar sessões.',
+            ephemeral: true
+          });
+        }
+
+        const parts = customId.split(':');
+        // O customId é: sessao_<acao>:<guildId>:<userId>:<joinId>
+        // A ação está embutida no prefixo (parts[0]), não é um campo separado.
+        const action = parts[0].includes('aprovar') ? 'aprovar' : 'reprovar';
+        const sessionGuildId = parts[1];
+        let targetId = parts[2];
+        let joinId = parts[3];
+        const sessDB = getDB(sessionGuildId);
+        let join = sessDB.getJoinById(targetId, joinId);
+
+        // Auto-heal 1: embeds antigos com userId/joinId trocados no customId
+        // (o id do join no slot do userId → ex: <@1792796977476-xxxx>). Se o
+        // slot não é um snowflake, procura o dono real do join no banco.
+        if (!join && /^\d+-[a-z0-9]+$/.test(targetId)) {
+          const found = sessDB.findJoinByIdGlobal(targetId);
+          if (found) {
+            Logger.warn(`🩹 customId antigo corrigido: join ${targetId} → usuário real ${found.userId} (${found.join.username || 'sem nome'})`);
+            join = found.join;
+            targetId = found.userId;
+            joinId = found.join.id;
+          }
+        }
+
+        // Auto-heal 2: se o id exato falhar, casa pelo ms embutido no id
+        // do join (±60s, o mais próximo).
+        if (!join) {
+          const idPrefix = parseInt(String(joinId).split('-')[0], 10);
+          if (Number.isFinite(idPrefix) && idPrefix > 1e12) {
+            const allJoins = sessDB.getUserJoins(targetId) || [];
+            join = allJoins
+              .map(j => ({ j, delta: Math.abs((parseInt(String(j.id).split('-')[0], 10) || 0) - idPrefix) }))
+              .filter(x => x.delta <= 60000)
+              .sort((a, b) => a.delta - b.delta)[0]?.j || null;
+          }
+        }
+
+        if (join?.approved) {
+          return interaction.reply({
+            content: '✅ Essa sessão já foi aprovada anteriormente.',
+            ephemeral: true
+          });
+        }
+
+        if (!join) {
+          const knownIds = (sessDB.getUserJoins(targetId) || []).map(x => x.id).slice(-5).join(', ');
+          Logger.warn(`⚠️ Verificação: registro não encontrado | raw="${customId}" | parsed: guild=${sessionGuildId} user=${targetId} join=${joinId} | joins recentes do user: [${knownIds}]`);
+          await interaction.deferUpdate();
+          const targetLabel = /^\d{5,20}$/.test(targetId) ? `<@${targetId}>` : `\`${targetId}\``;
+          const notFoundEmbed = new EmbedBuilder()
+            .setColor(Colors.Grey)
+            .setTitle('❓ REGISTRO NÃO ENCONTRADO')
+            .setDescription([
+              `### ${targetLabel}`,
+              '',
+              'O registro desta sessão não está mais no banco de dados.',
+              'Ele pode ter sido processado por outra instância do bot.',
+              '',
+              '💡 Use `/remove` para conferir e gerenciar as sessões desse usuário.'
+            ].join('\n'))
+            .setTimestamp();
+
+          return interaction.editReply({ embeds: [notFoundEmbed], components: [] });
+        }
+
+        await interaction.deferUpdate();
+
+        const attemptUnix = Math.floor(new Date(join.timestamp).getTime() / 1000);
+        const disabledRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`sessao_aprovar:${sessionGuildId}:${targetId}:${joinId}`)
+            .setLabel('Aprovar').setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(true),
+          new ButtonBuilder()
+            .setCustomId(`sessao_reprovar:${sessionGuildId}:${targetId}:${joinId}`)
+            .setLabel('Reprovar').setEmoji('❌').setStyle(ButtonStyle.Danger).setDisabled(true)
+        );
+
+        // ========== APROVAR ==========
+        if (action === 'aprovar') {
+          sessDB.updateJoin(targetId, join.id, {
+            approved: true,
+            approvedBy: user.id,
+            approvedAt: new Date().toISOString()
+          });
+          Logger.session(`✅ Sessão de ${join.username || targetId} aprovada pelo owner`);
+
+          const approvedEmbed = new EmbedBuilder()
+            .setColor(Colors.Green)
+            .setTitle('✅ SESSÃO APROVADA')
+            .setDescription([
+              `### <@${targetId}>`,
+              '',
+              `⏰ **Tentou acessar:** <t:${attemptUnix}:F>`,
+              `✅ Verificação concluída por <@${user.id}> — a sessão permanece contabilizada.`
+            ].join('\n'))
+            .setTimestamp();
+
+          // Log de auditoria
+          const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
+          if (logChannel) {
+            await logChannel.send({
+              content: `✅ Sessão de **${join.username || targetId}** aprovada por ${user.tag}`,
+              embeds: [approvedEmbed]
+            }).catch(e => Logger.warn(`⚠️ Erro ao enviar log de aprovação: ${e.message}`));
+          }
+
+          return interaction.editReply({ embeds: [approvedEmbed], components: [disabledRow] });
+        }
+
+        // ========== REPROVAR ==========
+        const sessionsBefore = sessDB.getSessions(targetId);
+        sessDB.removeJoin(targetId, { id: join.id });
+        const sessionsAfter = sessDB.removeSession(targetId);
+
+        // Bloquear solicitações pelo resto do dia
+        const targetUserData = sessDB.getUser(targetId);
+        const dayCfg = sessDB.config;
+        const today = Validators.getToday();
+        const maxDaily = dayCfg.settings?.maxDailyRequests || 1;
+        if (targetUserData) {
+          if (!targetUserData.dailyRequests) targetUserData.dailyRequests = {};
+          targetUserData.dailyRequests[today] = maxDaily;
+          targetUserData.lastRejectedSession = { date: today, joinId, rejectedAt: new Date().toISOString() };
+          sessDB.setUser(targetId, targetUserData);
+        }
+
+        // Despromoção automática (membro pode ter saído do servidor)
+        let demotion = null;
+        const targetGuild = client.guilds.cache.get(sessionGuildId);
+        if (targetGuild) {
+          try {
+            const targetMember = await targetGuild.members.fetch(targetId);
+            demotion = await TierManager.demoteIfBelow(targetMember);
+          } catch (error) {
+            // Membro não está mais no servidor
+          }
+        }
+
+        // Avisar o usuário no privado
+        let dmOk = false;
+        try {
+          const targetClientUser = await client.users.fetch(targetId);
+          const rejectDmEmbed = new EmbedBuilder()
+            .setColor(Colors.Red)
+            .setTitle('❌ SESSÃO REPROVADA')
+            .setDescription([
+              `Sua sessão de <t:${attemptUnix}:F> foi **reprovada** pela staff.`,
+              '',
+              '📴 A sessão foi removida da sua contagem.',
+              '🔒 Você está **bloqueado** de solicitar o link até amanhã.'
+            ].join('\n'))
+            .addFields({
+              name: '📝 SUAS SESSÕES AGORA',
+              value: `**${sessionsAfter}** sessão(ões)`
+            })
+            .setTimestamp();
+
+          await targetClientUser.send({ embeds: [rejectDmEmbed] });
+          dmOk = true;
+        } catch (error) {
+          Logger.warn(`⚠️ Não foi possível avisar ${join.username || targetId} no privado: ${error.message}`);
+        }
+
+        Logger.session(`❌ Sessão de ${join.username || targetId} reprovada pelo owner`);
+
+        const rejectedEmbed = new EmbedBuilder()
+          .setColor(Colors.Red)
+          .setTitle('❌ SESSÃO REPROVADA')
+          .setDescription([
+            `### <@${targetId}>`,
+            '',
+            `⏰ **Tentou acessar:** <t:${attemptUnix}:F>`,
+            '❌ Reprovada — a sessão foi removida da contagem.',
+            '🔒 O usuário está bloqueado de solicitar o link hoje.'
+          ].join('\n'))
+          .addFields([
+            {
+              name: '📝 SESSÕES',
+              value: `**${sessionsBefore}** → **${sessionsAfter}** sessão(ões)`,
+              inline: true
+            },
+            {
+              name: '📨 AVISO NO PRIVADO',
+              value: dmOk ? '✅ Usuário notificado' : '⚠️ DM fechada — usuário não avisado',
+              inline: true
+            }
+          ])
+          .setTimestamp();
+
+        if (demotion?.demoted) {
+          rejectedEmbed.addFields({
+            name: '⬇️ DESPROMOÇÃO APLICADA',
+            value: `Usuário ficou abaixo do mínimo: **Tier ${demotion.from}** → **Tier ${demotion.to}**`
+          });
+        }
+
+        // Log de auditoria
+        const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
+        if (logChannel) {
+          await logChannel.send({
+            content: `❌ Sessão de **${join.username || targetId}** reprovada por ${user.tag}`,
+            embeds: [rejectedEmbed]
+          }).catch(e => Logger.warn(`⚠️ Erro ao enviar log de reprovação: ${e.message}`));
+        }
+
+        return interaction.editReply({ embeds: [rejectedEmbed], components: [disabledRow] });
+      }
 
       // Botão de solicitar link
       if (customId === 'request_link') {
@@ -3289,6 +4302,19 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         const db = getDB(guildId);
+
+        // Bloqueio por reprovação no dia
+        if (db.getUser(user.id)?.lastRejectedSession?.date === Validators.getToday()) {
+          return interaction.reply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(Colors.Red)
+                .setTitle('❌ SESSÃO REPROVADA HOJE')
+                .setDescription('Você foi **reprovado** pela staff hoje e está bloqueado.\n📅 Tente novamente amanhã.')
+            ],
+            ephemeral: true
+          });
+        }
 
         // Verificar limite diário
         if (!db.canRequestToday(user.id)) {
@@ -3386,6 +4412,7 @@ client.on('interactionCreate', async (interaction) => {
 
       // Modal de solicitação de link
       if (customId === 'link_modal') {
+        const db = getDB(guildId);
         const confirmText = interaction.fields.getTextInputValue('confirm');
 
         if (confirmText !== 'CONFIRMAR') {
@@ -3400,14 +4427,26 @@ client.on('interactionCreate', async (interaction) => {
           });
         }
 
+        // Bloqueio por reprovação no dia
+        if (db.getUser(user.id)?.lastRejectedSession?.date === Validators.getToday()) {
+          return interaction.reply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(Colors.Red)
+                .setTitle('❌ SESSÃO REPROVADA HOJE')
+                .setDescription('Você foi **reprovado** pela staff hoje e está bloqueado.\n📅 Tente novamente amanhã.')
+            ],
+            ephemeral: true
+          });
+        }
+
         // Processar solicitação
-        const db = getDB(guildId);
         const currentTier = db.getUserTier(user.id);
 
         // Registrar
         db.addTodayRequest(user.id);
         const totalSessions = db.addSession(user.id);
-        db.addJoin(user.id, user.username, currentTier);
+        const joinRecord = db.addJoin(user.id, user.username, currentTier);
 
         // Enviar link
         const welcomeEmbed = Embeds.welcomeMessage(guildId, user, currentTier);
@@ -3415,6 +4454,9 @@ client.on('interactionCreate', async (interaction) => {
           embeds: [welcomeEmbed],
           ephemeral: true
         });
+
+        // Notificar o owner (aprovar/reprovar)
+        await notifyOwnerPendingSession(guildId, user.id, joinRecord, totalSessions);
 
         // Verificar promoção
         const promoted = await TierManager.promote(member);
@@ -3533,6 +4575,11 @@ client.on('interactionCreate', async (interaction) => {
 
           db.setConfig(cfg);
           await updateLinkPanel(guildId);
+
+          const promoted = await TierManager.reconcilePromotions(interaction.guild);
+          if (promoted.length > 0) {
+            Logger.promote(`🎉 ${promoted.length} membro(s) promovido(s) após edição de ${tierName}`);
+          }
 
           const level = parseInt(tierName.split('_')[1]);
           const emoji = TierManager.getTierEmoji(level);

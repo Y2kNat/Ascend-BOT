@@ -1,6 +1,6 @@
 {
   "name": "ascend-system",
-  "version": "9.0.0",
+  "version": "9.0.0-beta",
   "description": "Sistema de progressão por tiers",
   "main": "index.js",
   "scripts": {
